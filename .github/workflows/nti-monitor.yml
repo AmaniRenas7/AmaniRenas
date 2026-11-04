@@ -8,13 +8,13 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '2-59/5 * * * *'
+    - cron: '3-59/5 * * * *'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: nti-monitor
+  group: nti-exam-monitor
   cancel-in-progress: false
 
 jobs:
@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - name: Restore previous availability
+        uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -29,83 +31,187 @@ jobs:
         run: |
           npm install --no-save playwright
           npx playwright install --with-deps chromium
-      - name: Check NTI calendar
+      - name: Check NTI calendar and compare with previous scan
         env:
+          NTI_BOOKING_URL: ${{ secrets.NTI_BOOKING_URL }}
           NTI_EMAIL: ${{ secrets.NTI_EMAIL }}
           NTI_PASSWORD: ${{ secrets.NTI_PASSWORD }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_ALERT: ${{ inputs.test_alert || 'false' }}
         run: |
           cat > check.cjs <<'SCRIPT'
           const { chromium } = require('playwright');
-          const url = 'https://studier.nti.se/exam/66161946/book';
-          const { NTI_EMAIL: email, NTI_PASSWORD: password,
-            TELEGRAM_BOT_TOKEN: token, TELEGRAM_CHAT_ID: chat } = process.env;
-          async function alert(message) {
-            if (!token || !chat) throw Error('Missing Telegram secrets');
-            const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-              method: 'POST', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({chat_id: chat, text: message,
-                disable_notification: false})
-            });
-            if (!r.ok) throw Error('Telegram message failed: ' + r.status);
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          
+          const url = process.env.NTI_BOOKING_URL || 'https://studier.nti.se/exam/66161946/book';
+          const { NTI_EMAIL: email, NTI_PASSWORD: password } = process.env;
+          const testOnly = String(process.env.TEST_ALERT || '').toLowerCase() === 'true';
+          
+          function writeAlert(message) {
+            fs.writeFileSync('nti-alert-message.txt', message, 'utf8');
           }
-          async function check() {
-            if (process.env.TEST_ALERT === 'true') {
-              await alert('✅ Test alert works. NTI login has NOT been tested.');
-              return;
-            }
-            if (!email || !password) throw Error('Missing NTI login secrets');
+          
+          async function readAppointments() {
+            if (!email || !password) throw Error('Missing NTI_EMAIL or NTI_PASSWORD repository secret');
             const browser = await chromium.launch();
             try {
-              const page = await browser.newPage({locale: 'sv-SE',
-                timezoneId: 'Europe/Stockholm'});
-              await page.goto(url, {waitUntil: 'domcontentloaded'});
-              await page.waitForTimeout(2000);
+              const page = await browser.newPage({ locale: 'sv-SE', timezoneId: 'Europe/Stockholm' });
+              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+              await page.waitForTimeout(1500);
               let body = await page.locator('body').innerText();
               if (!/Lediga\s+platser\s*:\s*\d+/i.test(body)) {
                 const pwd = page.locator('input[type="password"]:visible').first();
-                if (!(await pwd.count())) throw Error('NTI login form not found');
                 const user = page.locator('input[type="email"]:visible, input[autocomplete="username"]:visible, input[type="text"]:visible').first();
-                if (!(await user.count())) throw Error('Email field not found');
+                if (!(await pwd.count()) || !(await user.count())) throw Error('Could not locate NTI login inputs');
                 await user.fill(email);
                 await pwd.fill(password);
-                const button = page.getByRole('button', {name: /logga\s*in/i}).first();
-                if (await button.count()) await button.click();
-                else await pwd.press('Enter');
+                const login = page.getByRole('button', { name: /logga\s*in|sign\s*in|login/i }).first();
+                if (await login.count()) await login.click(); else await pwd.press('Enter');
                 await page.waitForTimeout(1800);
-                await page.goto(url, {waitUntil: 'domcontentloaded'});
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
               }
-              await page.waitForFunction(() => /Lediga\s+platser\s*:\s*\d+/i.test(document.body.innerText), null, {timeout: 30000}).catch(()=>{});
-              body = await page.locator('body').innerText();
-              const matches = [...body.matchAll(/Lediga\s+platser\s*:\s*(\d+)/gi)];
-              const slots = matches.map((m,i) => {
-                const text = body.slice(m.index + m[0].length,
-                  i+1 < matches.length ? matches[i+1].index : undefined).slice(0,250);
-                const d = text.match(/20\d{2}-\d{2}-\d{2}/);
-                const t = text.match(/kl\.?\s*([012]?\d:[0-5]\d)/i);
-                return d && t ? {date:d[0], time:t[1].padStart(5,'0'), count:+m[1]} : null;
-              }).filter(Boolean);
-              if (!slots.length) throw Error('No booking slots found; login or parsing failed');
-              const now = new Intl.DateTimeFormat('sv-SE', {
-                timeZone:'Europe/Stockholm',year:'numeric',month:'2-digit',day:'2-digit',
-                hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date());
-              const open = slots.filter(s => s.count>0 && `${s.date} ${s.time}` > now);
-              console.log(`Calendar read: ${slots.length} slots, ${open.length} open.`);
-              if (open.length) {
-                await alert('🚨 NTI EXAM PLACES AVAILABLE!\n' +
-                  open.map(s=>`${s.date} ${s.time}: ${s.count} places`).join('\n') +
-                  '\nBook now: ' + url);
-              }
-            } finally { await browser.close(); }
+              await page.waitForFunction(() => /Lediga\s+platser\s*:\s*\d+/i.test(document.body.innerText), null, { timeout: 30000 });
+              const slots = await page.evaluate(() => {
+                const entries = [];
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                while ((node = walker.nextNode())) {
+                  if (!/Lediga\s+platser/i.test(node.textContent || '')) continue;
+                  let box = node.parentElement;
+                  while (box && box !== document.body) {
+                    const content = box.innerText || '';
+                    const countMatches = [...content.matchAll(/Lediga\s+platser\s*:\s*(\d+)/gi)];
+                    if (countMatches.length > 1) break; // Parent contains several appointments.
+                    const dates = [...content.matchAll(/\b20\d{2}-\d{2}-\d{2}\b/g)];
+                    const times = [...content.matchAll(/\bkl\.?\s*([01]?\d|2[0-3]):([0-5]\d)\b/gi)];
+                    if (countMatches.length === 1 && dates.length === 1 && times.length === 1) {
+                      let room = '';
+                      for (let parent = box.parentElement; parent && parent !== document.body; parent = parent.parentElement) {
+                        const header = parent.querySelector('.card-header');
+                        if (header && /^Sal\s+/i.test(header.innerText.trim())) {
+                          room = header.innerText.trim().replace(/\s+/g, ' ');
+                          break;
+                        }
+                      }
+                      // Fallback to nearest preceding room heading, for layouts without Bootstrap card headers.
+                      if (!room) {
+                        const headers = [...document.querySelectorAll('.card-header,h1,h2,h3,h4')];
+                        for (const h of headers) {
+                          if (/^Sal\s+/i.test(h.innerText.trim()) &&
+                              (h.compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+                            room = h.innerText.trim().replace(/\s+/g, ' ');
+                          }
+                        }
+                      }
+                      let colour = 'unknown';
+                      for (let parent = box; parent && parent !== document.body; parent = parent.parentElement) {
+                        if (parent !== box && [...(parent.innerText || '').matchAll(/Lediga\s+platser\s*:\s*\d+/gi)].length > 1) break;
+                        const cls = typeof parent.className === 'string' ? parent.className : '';
+                        if (/\b(alert-success|bg-success|table-success)\b/i.test(cls)) { colour = 'green'; break; }
+                        if (/\b(alert-danger|bg-danger|table-danger)\b/i.test(cls)) { colour = 'red'; break; }
+                        const rgb = getComputedStyle(parent).backgroundColor.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                        if (rgb) {
+                          const [r,g,b] = rgb.slice(1).map(Number);
+                          if (g > r + 8 && g > b + 8) { colour = 'green'; break; }
+                          if (r > g + 8 && r > b + 8) { colour = 'red'; break; }
+                        }
+                      }
+                      entries.push({
+                        room,
+                        date: dates[0][0],
+                        time: times[0][1].padStart(2, '0') + ':' + times[0][2],
+                        count: Number(countMatches[0][1]),
+                        colour
+                      });
+                      break;
+                    }
+                    box = box.parentElement;
+                  }
+                }
+                return entries;
+              });
+              if (!slots.length) throw Error('No appointment cards found; cannot trust the check');
+              // Duplicate slots in different rooms must remain distinguishable.
+              if (slots.some(s => !s.room)) throw Error('Could not identify every exam room; no misleading alerts sent');
+              const ids = slots.map(s => s.room + '|' + s.date + '|' + s.time);
+              if (new Set(ids).size !== ids.length) throw Error('Duplicate appointment identifiers; cannot trust the check');
+              if (slots.some(s => (s.count > 0 && s.colour === 'red') || (s.count === 0 && s.colour === 'green')))
+                throw Error('Card colour and free-place count disagree; no alerts sent');
+              return slots;
+            } finally {
+              await browser.close();
+            }
           }
-          check().catch(async e => {
-            console.error('Check failed:', e.message);
-            try { if (token && chat) await alert('⚠️ NTI monitor failed. Check GitHub Actions: '+e.message); }
-            catch(err) { console.error('Could not notify:', err.message); }
-            process.exitCode=1;
-          });
+          
+          async function main() {
+            if (testOnly) {
+              writeAlert('✅ Telegram test works. NTI calendar has NOT been checked.');
+              return;
+            }
+            const slots = await readAppointments();
+            const currentDateTime = (() => {
+              const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+                timeZone: 'Europe/Stockholm', year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+              }).formatToParts(new Date()).map(v => [v.type, v.value]));
+              return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+            })();
+            const future = slots.filter(s => `${s.date} ${s.time}` > currentDateTime);
+            const key = s => crypto.createHash('sha256').update(`${s.room}|${s.date}|${s.time}`).digest('hex');
+            const next = Object.fromEntries(future.map(s => [key(s), s.count]).sort((a,b) => a[0].localeCompare(b[0])));
+            const path = '.nti-monitor-state.json';
+            let previous = {};
+            if (fs.existsSync(path)) previous = JSON.parse(fs.readFileSync(path, 'utf8')).slots || {};
+            const changed = future.filter(s => s.count > 0 && previous[key(s)] !== s.count);
+            // An initial run reports existing open places ONCE. Later checks only report changed positive counts.
+            fs.writeFileSync(path, JSON.stringify({version: 1, slots: next}, null, 2) + '\n', 'utf8');
+            console.log(`NTI calendar checked: ${slots.length} appointment cards, ${future.length} future slots.`);
+            console.log(`Availability changes needing an alert: ${changed.length}.`);
+            if (changed.length) {
+              writeAlert('🚨 NTI EXAM AVAILABILITY CHANGED!\n' +
+                changed.map(s => `${s.date} ${s.time} | ${s.room}: ${s.count} available` +
+                  (previous[key(s)] === undefined ? ' (new)' : ` (previously ${previous[key(s)]})`)).join('\n') +
+                '\nBook here: ' + url);
+            }
+          }
+          main().catch(err => { console.error('NTI monitor check failed:', err.message); process.exitCode = 1; });
           SCRIPT
           node check.cjs
+      - name: Remember appointment counts for next scan
+        if: ${{ inputs.test_alert != true }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .nti-monitor-state.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update NTI monitor state [skip ci]'
+            git push
+          else
+            echo 'No availability changes to save.'
+          fi
+      - name: Send Telegram alert only for changed availability
+        if: ${{ hashFiles('nti-alert-message.txt') != '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          node - <<'SCRIPT'
+          const fs = require('node:fs');
+          (async () => {
+            const token = process.env.TELEGRAM_BOT_TOKEN;
+            const chat = process.env.TELEGRAM_CHAT_ID;
+            if (!token || !chat) throw Error('Telegram secrets missing');
+            const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chat,
+                text: fs.readFileSync('nti-alert-message.txt', 'utf8'),
+                disable_notification: false
+              })
+            });
+            if (!r.ok) throw Error('Telegram could not deliver alert: HTTP ' + r.status);
+            console.log('Telegram availability-change alert sent.');
+          })().catch(e => { console.error(e.message); process.exitCode = 1; });
+          SCRIPT
 
