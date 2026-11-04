@@ -1,0 +1,111 @@
+name: NTI exam monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a test notification only'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '2-59/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nti-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install browser
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+      - name: Check NTI calendar
+        env:
+          NTI_EMAIL: ${{ secrets.NTI_EMAIL }}
+          NTI_PASSWORD: ${{ secrets.NTI_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_ALERT: ${{ inputs.test_alert || 'false' }}
+        run: |
+          cat > check.cjs <<'SCRIPT'
+          const { chromium } = require('playwright');
+          const url = 'https://studier.nti.se/exam/66161946/book';
+          const { NTI_EMAIL: email, NTI_PASSWORD: password,
+            TELEGRAM_BOT_TOKEN: token, TELEGRAM_CHAT_ID: chat } = process.env;
+          async function alert(message) {
+            if (!token || !chat) throw Error('Missing Telegram secrets');
+            const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({chat_id: chat, text: message,
+                disable_notification: false})
+            });
+            if (!r.ok) throw Error('Telegram message failed: ' + r.status);
+          }
+          async function check() {
+            if (process.env.TEST_ALERT === 'true') {
+              await alert('✅ Test alert works. NTI login has NOT been tested.');
+              return;
+            }
+            if (!email || !password) throw Error('Missing NTI login secrets');
+            const browser = await chromium.launch();
+            try {
+              const page = await browser.newPage({locale: 'sv-SE',
+                timezoneId: 'Europe/Stockholm'});
+              await page.goto(url, {waitUntil: 'domcontentloaded'});
+              await page.waitForTimeout(2000);
+              let body = await page.locator('body').innerText();
+              if (!/Lediga\s+platser\s*:\s*\d+/i.test(body)) {
+                const pwd = page.locator('input[type="password"]:visible').first();
+                if (!(await pwd.count())) throw Error('NTI login form not found');
+                const user = page.locator('input[type="email"]:visible, input[autocomplete="username"]:visible, input[type="text"]:visible').first();
+                if (!(await user.count())) throw Error('Email field not found');
+                await user.fill(email);
+                await pwd.fill(password);
+                const button = page.getByRole('button', {name: /logga\s*in/i}).first();
+                if (await button.count()) await button.click();
+                else await pwd.press('Enter');
+                await page.waitForTimeout(1800);
+                await page.goto(url, {waitUntil: 'domcontentloaded'});
+              }
+              await page.waitForFunction(() => /Lediga\s+platser\s*:\s*\d+/i.test(document.body.innerText), null, {timeout: 30000}).catch(()=>{});
+              body = await page.locator('body').innerText();
+              const matches = [...body.matchAll(/Lediga\s+platser\s*:\s*(\d+)/gi)];
+              const slots = matches.map((m,i) => {
+                const text = body.slice(m.index + m[0].length,
+                  i+1 < matches.length ? matches[i+1].index : undefined).slice(0,250);
+                const d = text.match(/20\d{2}-\d{2}-\d{2}/);
+                const t = text.match(/kl\.?\s*([012]?\d:[0-5]\d)/i);
+                return d && t ? {date:d[0], time:t[1].padStart(5,'0'), count:+m[1]} : null;
+              }).filter(Boolean);
+              if (!slots.length) throw Error('No booking slots found; login or parsing failed');
+              const now = new Intl.DateTimeFormat('sv-SE', {
+                timeZone:'Europe/Stockholm',year:'numeric',month:'2-digit',day:'2-digit',
+                hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date());
+              const open = slots.filter(s => s.count>0 && `${s.date} ${s.time}` > now);
+              console.log(`Calendar read: ${slots.length} slots, ${open.length} open.`);
+              if (open.length) {
+                await alert('🚨 NTI EXAM PLACES AVAILABLE!\n' +
+                  open.map(s=>`${s.date} ${s.time}: ${s.count} places`).join('\n') +
+                  '\nBook now: ' + url);
+              }
+            } finally { await browser.close(); }
+          }
+          check().catch(async e => {
+            console.error('Check failed:', e.message);
+            try { if (token && chat) await alert('⚠️ NTI monitor failed. Check GitHub Actions: '+e.message); }
+            catch(err) { console.error('Could not notify:', err.message); }
+            process.exitCode=1;
+          });
+          SCRIPT
+          node check.cjs
+
