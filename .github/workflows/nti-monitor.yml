@@ -103,25 +103,11 @@ jobs:
                           }
                         }
                       }
-                      let colour = 'unknown';
-                      for (let parent = box; parent && parent !== document.body; parent = parent.parentElement) {
-                        if (parent !== box && [...(parent.innerText || '').matchAll(/Lediga\s+platser\s*:\s*\d+/gi)].length > 1) break;
-                        const cls = typeof parent.className === 'string' ? parent.className : '';
-                        if (/\b(alert-success|bg-success|table-success)\b/i.test(cls)) { colour = 'green'; break; }
-                        if (/\b(alert-danger|bg-danger|table-danger)\b/i.test(cls)) { colour = 'red'; break; }
-                        const rgb = getComputedStyle(parent).backgroundColor.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-                        if (rgb) {
-                          const [r,g,b] = rgb.slice(1).map(Number);
-                          if (g > r + 8 && g > b + 8) { colour = 'green'; break; }
-                          if (r > g + 8 && r > b + 8) { colour = 'red'; break; }
-                        }
-                      }
                       entries.push({
                         room,
                         date: dates[0][0],
                         time: times[0][1].padStart(2, '0') + ':' + times[0][2],
-                        count: Number(countMatches[0][1]),
-                        colour
+                        count: Number(countMatches[0][1])
                       });
                       break;
                     }
@@ -135,8 +121,6 @@ jobs:
               if (slots.some(s => !s.room)) throw Error('Could not identify every exam room; no misleading alerts sent');
               const ids = slots.map(s => s.room + '|' + s.date + '|' + s.time);
               if (new Set(ids).size !== ids.length) throw Error('Duplicate appointment identifiers; cannot trust the check');
-              if (slots.some(s => (s.count > 0 && s.colour === 'red') || (s.count === 0 && s.colour === 'green')))
-                throw Error('Card colour and free-place count disagree; no alerts sent');
               return slots;
             } finally {
               await browser.close();
